@@ -668,10 +668,11 @@ pub fn apply_org_override(cfg: &mut Config, org: String) -> Result<()> {
 /// Returns None silently on any error — callers fall through to other auth methods.
 #[cfg(all(not(feature = "browser"), not(target_arch = "wasm32")))]
 pub fn load_token_from_storage(site: &str, org: Option<&str>) -> Option<String> {
+    let _session_lock = crate::auth::storage::lock_sessions().ok()?;
     let guard = crate::auth::storage::get_storage().ok()?;
     let lock = guard.lock().ok()?;
     let store = lock.as_ref()?;
-    let tokens = store.load_tokens(site, org).ok()??;
+    let tokens = store.reload_tokens(site, org).ok()??;
     let creds = store.load_client_credentials(site).ok().flatten();
 
     drop(lock);
@@ -727,10 +728,7 @@ pub fn load_token_from_storage(site: &str, org: Option<&str>) -> Option<String> 
 /// Reads storage again, bypassing the per-process memo, and returns the access
 /// token if it is now valid.
 ///
-/// When several pup processes refresh the same expired token at once, one
-/// succeeds and saves a new token set; the refreshes of the others then fail.
-/// Their memoized copy still holds the old, expired tokens, so without a fresh
-/// read they report the token as expired although a valid one is in storage.
+/// A fresh read also observes credentials saved by external storage clients.
 #[cfg(all(not(feature = "browser"), not(target_arch = "wasm32")))]
 fn valid_token_after_reload(
     store: &dyn crate::auth::storage::Storage,
@@ -788,7 +786,10 @@ where
     };
 
     match refresh_fn(&tokens.refresh_token, &tokens.refresh_credentials(creds)) {
-        Some(new_tokens) => ResolvedToken::Refreshed(new_tokens),
+        Some(mut new_tokens) => {
+            new_tokens.session_id = tokens.session_id;
+            ResolvedToken::Refreshed(new_tokens)
+        }
         None => ResolvedToken::Expired,
     }
 }
@@ -2442,6 +2443,7 @@ profiles:
 
     fn make_token_set(issued_ago_secs: i64, expires_in: i64, refresh: &str) -> TokenSet {
         TokenSet {
+            session_id: String::new(),
             access_token: "old-access-token".into(),
             refresh_token: refresh.into(),
             token_type: "Bearer".into(),
@@ -2464,6 +2466,7 @@ profiles:
 
     fn make_refreshed_token_set() -> TokenSet {
         TokenSet {
+            session_id: String::new(),
             access_token: "fresh-access-token".into(),
             refresh_token: "fresh-refresh-token".into(),
             token_type: "Bearer".into(),
@@ -2594,7 +2597,8 @@ profiles:
 
     #[test]
     fn test_resolve_token_expired_refresh_succeeds() {
-        let tokens = make_token_set(7200, 3600, "refresh");
+        let mut tokens = make_token_set(7200, 3600, "refresh");
+        tokens.session_id = "original-login".into();
         let creds = make_creds();
         let result = super::resolve_token(tokens, Some(&creds), |rt, c| {
             assert_eq!(rt, "refresh");
@@ -2605,6 +2609,7 @@ profiles:
             super::ResolvedToken::Refreshed(t) => {
                 assert_eq!(t.access_token, "fresh-access-token");
                 assert_eq!(t.refresh_token, "fresh-refresh-token");
+                assert_eq!(t.session_id, "original-login");
             }
             _ => panic!("expected Refreshed"),
         }

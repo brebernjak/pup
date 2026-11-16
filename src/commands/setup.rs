@@ -929,6 +929,7 @@ mod tests {
     fn saved_scopes_count_only_for_the_active_token() {
         let _guard = crate::test_utils::ENV_LOCK.blocking_lock();
         let saved = |token: &str| crate::auth::types::TokenSet {
+            session_id: String::new(),
             access_token: token.into(),
             refresh_token: String::new(),
             token_type: "Bearer".into(),

@@ -1113,7 +1113,9 @@ pub fn prune_other_default_sessions(keep_site: &str) -> Result<()> {
     let mut lock = guard.lock().unwrap();
     let store = lock.as_mut().unwrap();
     for site in &to_prune {
-        let _ = store.delete_tokens(site, None);
+        if store.reload_tokens(site, None).is_ok() {
+            let _ = store.delete_tokens(site, None);
+        }
     }
     Ok(())
 }
@@ -1141,6 +1143,42 @@ fn write_sessions(sessions: &[SessionEntry]) -> Result<()> {
     Ok(())
 }
 
+/// Serializes saved-session transactions across Pup processes. The single lock
+/// also protects site-wide token maps and the shared session registry. It lives
+/// at a fixed home-relative path because keychain credentials are shared across
+/// configs, and cache cleanup must not remove a lock held by another process.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn lock_sessions() -> Result<std::fs::File> {
+    let dir = dirs::home_dir()
+        .context("could not determine authentication lock directory")?
+        .join(".config/pup");
+    lock_sessions_in(&dir)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn lock_sessions_in(dir: &Path) -> Result<std::fs::File> {
+    std::fs::create_dir_all(dir)?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(dir.join("auth.lock"))?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                anyhow::bail!("another Pup authentication operation is busy; retry shortly")
+            }
+            Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1151,8 +1189,28 @@ mod tests {
 
     // --- helpers ------------------------------------------------------------
 
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn session_lock_excludes_other_handles_and_releases_on_drop() {
+        let directory = TempDir::new("session_lock");
+        let lock = lock_sessions_in(directory.path()).unwrap();
+        let path = directory.path().join("auth.lock");
+        let other = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        assert!(matches!(
+            other.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        drop(lock);
+        other.lock().unwrap();
+    }
+
     fn make_token(access: &str) -> TokenSet {
         TokenSet {
+            session_id: String::new(),
             access_token: access.to_string(),
             refresh_token: "refresh".into(),
             token_type: "Bearer".into(),

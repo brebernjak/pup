@@ -4,6 +4,9 @@ use serde::{Deserialize, Serialize};
 /// OAuth2 token set (JSON cross-compatible with Go/TypeScript versions).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenSet {
+    /// Identifies one login; refreshes retain this value.
+    #[serde(default)]
+    pub session_id: String,
     pub access_token: String,
     pub refresh_token: String,
     #[serde(default = "default_token_type")]
@@ -355,6 +358,7 @@ mod tests {
 
     fn make_token(issued_ago_secs: i64, expires_in: i64) -> TokenSet {
         TokenSet {
+            session_id: String::new(),
             access_token: "test".into(),
             refresh_token: "refresh".into(),
             token_type: "Bearer".into(),
@@ -428,6 +432,19 @@ mod tests {
             assert!(msg.contains("('datadog-api-claude-plugin')"), "{msg}");
             assert!(msg.ends_with("Run 'pup auth login' to switch."), "{msg}");
         }
+    }
+
+    #[test]
+    fn session_id_is_optional_for_legacy_tokens_and_persists() {
+        let token = make_token(0, 3600);
+        let mut json = serde_json::to_value(&token).unwrap();
+        json.as_object_mut().unwrap().remove("session_id");
+        let mut migrated: TokenSet = serde_json::from_value(json).unwrap();
+        assert!(migrated.session_id.is_empty());
+        migrated.session_id = "saved-login-generation".into();
+        let restored: TokenSet =
+            serde_json::from_str(&serde_json::to_string(&migrated).unwrap()).unwrap();
+        assert_eq!(restored.session_id, "saved-login-generation");
     }
 
     #[test]
