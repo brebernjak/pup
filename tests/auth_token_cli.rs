@@ -3,7 +3,7 @@
 
 use serde_json::{json, Value};
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 const SITE: &str = "datadoghq.com";
 
@@ -14,6 +14,17 @@ impl SessionFixture {
         let path = std::env::temp_dir().join(format!("pup-auth-token-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&path).unwrap();
         Self(path)
+    }
+
+    fn session(org: Option<&str>, id: &str) -> Self {
+        let fixture = Self::new();
+        fixture.register(SITE, org);
+        fixture.token(org, id);
+        fixture
+    }
+
+    fn read(&self, org: Option<&str>) -> Value {
+        response(self.export(org).output().unwrap())
     }
 
     fn write(&self, name: &str, value: Value) {
@@ -38,6 +49,8 @@ impl SessionFixture {
     fn command(&self) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_pup"));
         command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .env_clear()
             .env("PUP_CONFIG_DIR", &self.0)
             .env("DD_TOKEN_STORAGE", "file")
@@ -84,12 +97,18 @@ fn response(output: Output) -> Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
+fn rejected(output: Output) -> String {
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(!error.contains("fixture-access"));
+    error
+}
+
 #[test]
 fn exports_only_selected_session_and_access_credentials() {
     for org in [None, Some("production")] {
-        let fixture = SessionFixture::new();
-        fixture.register(SITE, org);
-        fixture.token(org, "selected-login");
+        let fixture = SessionFixture::session(org, "selected-login");
         fixture.write(
             "config.yaml",
             json!({"access_token": "config-token", "site": "datadoghq.eu"}),
@@ -117,36 +136,23 @@ fn exports_only_selected_session_and_access_credentials() {
 #[test]
 fn displaced_and_logged_out_sessions_cannot_be_exported() {
     for org in [None, Some("production")] {
-        let fixture = SessionFixture::new();
-        fixture.register(SITE, org);
-        fixture.token(org, "original-login");
-        assert_eq!(
-            response(fixture.export(org).output().unwrap())["session_id"],
-            "original-login"
-        );
-        fixture.register("datadoghq.eu", org);
+        let fixture = SessionFixture::session(org, "original-login");
+        assert_eq!(fixture.read(org)["session_id"], "original-login");
         for registry in [json!([{"site": "datadoghq.eu", "org": org}]), json!([])] {
             fixture.write("sessions.json", registry);
-            let output = fixture.export(org).output().unwrap();
-            assert!(!output.status.success());
-            assert!(output.stdout.is_empty());
-            assert!(!String::from_utf8_lossy(&output.stderr).contains("fixture-access"));
+            rejected(fixture.export(org).output().unwrap());
         }
     }
 }
 
 #[test]
 fn concurrent_exports_assign_one_identity_to_registered_legacy_login() {
-    let fixture = SessionFixture::new();
-    fixture.register(SITE, None);
-    fixture.token(None, "");
+    let fixture = SessionFixture::session(None, "");
     let children: Vec<_> = (0..8)
         .map(|index| {
             fixture
                 .export(None)
                 .env("XDG_CACHE_HOME", fixture.0.join(format!("cache-{index}")))
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
                 .spawn()
                 .unwrap()
         })
@@ -159,28 +165,18 @@ fn concurrent_exports_assign_one_identity_to_registered_legacy_login() {
     assert!(uuid::Uuid::parse_str(id).is_ok());
     assert!(results.iter().all(|result| result["session_id"] == id));
     fixture.token(None, "replacement-login");
-    assert_eq!(
-        response(fixture.export(None).output().unwrap())["session_id"],
-        "replacement-login"
-    );
+    assert_eq!(fixture.read(None)["session_id"], "replacement-login");
 }
 
 #[cfg(unix)] // HOME isolates dirs::home_dir on Unix; Windows uses the OS profile.
 #[test]
 fn export_waits_for_saved_session_transaction_then_reads_latest() {
-    let fixture = SessionFixture::new();
-    fixture.register(SITE, None);
-    fixture.token(None, "original-login");
+    let fixture = SessionFixture::session(None, "original-login");
     let directory = fixture.0.join(".config/pup");
     std::fs::create_dir_all(&directory).unwrap();
     let lock = std::fs::File::create(directory.join("auth.lock")).unwrap();
     lock.lock().unwrap();
-    let mut child = fixture
-        .export(None)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut child = fixture.export(None).spawn().unwrap();
     std::thread::sleep(std::time::Duration::from_millis(250));
     assert!(
         child.try_wait().unwrap().is_none(),
@@ -198,34 +194,20 @@ fn export_waits_for_saved_session_transaction_then_reads_latest() {
 fn stored_export_requires_explicit_selection_and_never_falls_back() {
     let fixture = SessionFixture::new();
     for args in [
-        vec!["auth", "token", "--stored-session"],
-        vec!["auth", "token", "--stored-session", "--json"],
-        vec!["auth", "token", "--json"],
-        vec![
-            "auth",
-            "token",
-            "--stored-session",
-            "--json",
-            "--site",
-            "example.com",
-        ],
-        vec![
-            "auth",
-            "token",
-            "--stored-session",
-            "--json",
-            "--site",
-            SITE,
-        ],
+        vec!["--stored-session"],
+        vec!["--stored-session", "--json"],
+        vec!["--json"],
+        vec!["--stored-session", "--json", "--site", "example.com"],
+        vec!["--stored-session", "--json", "--site", SITE],
     ] {
         let result = fixture
             .command()
+            .args(["auth", "token"])
             .args(args)
             .env("DD_ACCESS_TOKEN", "ambient-token")
             .output()
             .unwrap();
-        assert!(!result.status.success());
-        assert!(result.stdout.is_empty());
+        rejected(result);
     }
     let result = fixture
         .command()
@@ -253,20 +235,14 @@ fn unusable_saved_tokens_fail_without_exporting_credentials() {
                 "expires_in": if expired { 0 } else { 3600 }, "session_id": "login"
             }}),
         );
-        let output = fixture.export(None).output().unwrap();
-        assert!(!output.status.success());
-        assert!(output.stdout.is_empty());
-        let error = String::from_utf8(output.stderr).unwrap();
+        let error = rejected(fixture.export(None).output().unwrap());
         assert!(error.contains("pup auth login"));
-        assert!(!error.contains("fixture-access"));
     }
 }
 
 #[test]
 fn logout_removes_the_registered_session_from_export() {
-    let fixture = SessionFixture::new();
-    fixture.register(SITE, Some("production"));
-    fixture.token(Some("production"), "login");
+    let fixture = SessionFixture::session(Some("production"), "login");
     let output = fixture
         .command()
         .args(["--org", "production", "auth", "logout"])
@@ -277,7 +253,5 @@ fn logout_removes_the_registered_session_from_export() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let output = fixture.export(Some("production")).output().unwrap();
-    assert!(!output.status.success());
-    assert!(output.stdout.is_empty());
+    rejected(fixture.export(Some("production")).output().unwrap());
 }
