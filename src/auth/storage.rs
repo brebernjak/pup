@@ -326,7 +326,8 @@ impl KeychainStorage {
         // rather than silently losing tokens at runtime.
         #[cfg(target_os = "windows")]
         {
-            let entry = keyring::Entry::new(SERVICE_NAME, "__pup_probe__")
+            let probe_key = format!("__pup_probe__{}", uuid::Uuid::new_v4());
+            let entry = keyring::Entry::new(SERVICE_NAME, &probe_key)
                 .map_err(|e| anyhow::anyhow!("keychain not available: {e}"))?;
             entry
                 .set_password("probe")
@@ -1125,7 +1126,9 @@ pub fn prune_other_default_sessions(keep_site: &str) -> Result<()> {
     let mut lock = guard.lock().unwrap();
     let store = lock.as_mut().unwrap();
     for site in &to_prune {
-        let _ = store.delete_tokens(site, None);
+        if store.reload_tokens(site, None).is_ok() {
+            let _ = store.delete_tokens(site, None);
+        }
     }
     Ok(())
 }
@@ -1153,6 +1156,56 @@ fn write_sessions(sessions: &[SessionEntry]) -> Result<()> {
     Ok(())
 }
 
+/// Lock the config's session registry and file credentials. Keychain credentials
+/// also require a user-wide lock because they are shared across config directories.
+/// Always acquire the config lock first; neither lock belongs in a cache directory.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn lock_sessions() -> Result<Vec<std::fs::File>> {
+    let dir = crate::settings::auth_config_dir()
+        .context("could not determine authentication config directory")?;
+    let mut locks = vec![lock_session_file(&dir.join("auth.lock"))?];
+    // Backend detection may probe Secret Service; keep its synchronous wrappers
+    // off Tokio runtime threads, as with the credential operations themselves.
+    let backend = std::thread::spawn(|| -> Result<BackendType> {
+        let storage = get_storage()?.lock().unwrap();
+        Ok(storage.as_ref().unwrap().backend_type())
+    })
+    .join()
+    .map_err(|_| anyhow::anyhow!("storage worker thread panicked"))??;
+    if backend == BackendType::Keychain {
+        let home = dirs::home_dir().context("could not determine keychain lock directory")?;
+        locks.push(lock_session_file(&home.join(".config/pup/keychain.lock"))?);
+    }
+    Ok(locks)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn lock_session_file(path: &Path) -> Result<std::fs::File> {
+    std::fs::create_dir_all(
+        path.parent()
+            .context("authentication lock needs a directory")?,
+    )?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                anyhow::bail!("another Pup authentication operation is busy; retry shortly")
+            }
+            Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1163,8 +1216,28 @@ mod tests {
 
     // --- helpers ------------------------------------------------------------
 
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn session_lock_excludes_other_handles_and_releases_on_drop() {
+        let directory = TempDir::new("session_lock");
+        let path = directory.path().join("auth.lock");
+        let lock = lock_session_file(&path).unwrap();
+        let other = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        assert!(matches!(
+            other.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        drop(lock);
+        other.lock().unwrap();
+    }
+
     fn make_token(access: &str) -> TokenSet {
         TokenSet {
+            session_id: String::new(),
             access_token: access.to_string(),
             refresh_token: "refresh".into(),
             token_type: "Bearer".into(),

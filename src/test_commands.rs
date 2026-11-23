@@ -360,7 +360,7 @@ fn test_auth_token_parses_and_appears_in_human_help() {
     assert!(matches!(
         cli.command,
         crate::Commands::Auth {
-            action: crate::AuthActions::Token
+            action: crate::AuthActions::Token { .. }
         }
     ));
 

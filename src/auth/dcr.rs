@@ -187,6 +187,7 @@ impl DcrClient {
             .context("failed to parse token response")?;
 
         Ok(TokenSet {
+            session_id: String::new(),
             access_token: token_resp.access_token,
             refresh_token: token_resp.refresh_token,
             token_type: token_resp.token_type,

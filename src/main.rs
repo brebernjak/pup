@@ -13506,7 +13506,17 @@ enum AuthActions {
     },
     /// Print the current OAuth access token for credential-command integrations
     #[cfg(not(target_arch = "wasm32"))]
-    Token,
+    Token {
+        /// Return a stored OAuth session, ignoring ambient credentials.
+        #[arg(long, requires = "json", requires = "site")]
+        stored_session: bool,
+        /// Print the saved session as JSON (access_token, site, session_id, scope).
+        #[arg(long, requires = "stored_session")]
+        json: bool,
+        /// Datadog site of the registered session. Omit --org for the default login.
+        #[arg(long, requires = "stored_session")]
+        site: Option<String>,
+    },
     /// Refresh access token
     Refresh,
     /// List all stored org sessions
@@ -16564,6 +16574,24 @@ async fn dispatch_parsed(
             }
         }
         return Ok(());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Commands::Auth {
+        action:
+            AuthActions::Token {
+                stored_session: true,
+                site,
+                ..
+            },
+    } = &cli.command
+    {
+        return commands::auth::stored_session_token(
+            site.as_deref()
+                .ok_or_else(|| anyhow::anyhow!("--site is required with --stored-session"))?,
+            cli.org.as_deref(),
+        )
+        .await;
     }
 
     let mut cfg = match provided_cfg {
@@ -21840,7 +21868,7 @@ async fn dispatch_parsed(
                 commands::auth::status(&cfg)?
             }
             #[cfg(not(target_arch = "wasm32"))]
-            AuthActions::Token => commands::auth::token(&cfg)?,
+            AuthActions::Token { .. } => commands::auth::token(&cfg)?,
             AuthActions::Refresh => {
                 // Refresh POSTs the stored refresh token to cfg.site; gate it like
                 // login/status (the pre-match gate skips all Auth subcommands).

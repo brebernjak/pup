@@ -99,9 +99,14 @@ pub async fn login(
         );
     }
 
-    // 2. Load existing client credentials (lock released before any await)
-    // Client credentials are site-scoped (DCR is per-site, shared across orgs)
-    let existing_creds = with_storage(|store| store.load_client_credentials(site))?;
+    // 2. Serialize client registration across processes. Client credentials
+    // are site-scoped and shared across orgs; release before browser login.
+    let client_lock = storage::lock_sessions()?;
+    let existing_creds = with_storage(|store| {
+        // Invalidate cached state, but allow login to replace unreadable tokens.
+        let _ = store.reload_tokens(site, org);
+        store.load_client_credentials(site)
+    })?;
 
     let creds = match existing_creds {
         Some(creds) if creds.client_name == dcr::DCR_CLIENT_NAME => {
@@ -122,6 +127,8 @@ pub async fn login(
             creds
         }
     };
+
+    drop(client_lock);
 
     // 3. Generate PKCE challenge + state
     let challenge = pkce::generate_pkce_challenge()?;
@@ -189,7 +196,7 @@ pub async fn login(
     // 7. Exchange code for tokens.
     let effective_site = resolve_effective_site(site, result.domain.as_deref());
     eprintln!("🔄 Exchanging authorization code for tokens...");
-    let tokens = dcr::DcrClient::new(effective_site)
+    let mut tokens = dcr::DcrClient::new(effective_site)
         .exchange_code(&result.code, &redirect_uri, &challenge.verifier, &creds)
         .await?;
 
@@ -236,7 +243,11 @@ pub async fn login(
     let saved_org = saved_org_owned.as_deref();
     let saved_org_label = org_suffix(saved_org);
 
+    let _session_lock = storage::lock_sessions()?;
+    tokens.session_id = uuid::Uuid::new_v4().to_string();
     let location = with_storage(|store| {
+        // A new login can repair malformed token storage. Saving still reports errors.
+        let _ = store.reload_tokens(effective_site, saved_org);
         store.save_tokens(effective_site, saved_org, &tokens)?;
         Ok(store.storage_location())
     })?;
@@ -390,6 +401,7 @@ pub async fn login(
 
 #[cfg(not(target_arch = "wasm32"))]
 pub async fn logout(cfg: &Config) -> Result<()> {
+    let _session_lock = storage::lock_sessions()?;
     let org = cfg.org.as_deref();
     // Collect all sessions matching this org name before removing them. Under
     // the one-per-name invariant there is normally only one, but legacy
@@ -402,6 +414,8 @@ pub async fn logout(cfg: &Config) -> Result<()> {
         .collect();
     with_storage(|store| {
         for s in &sessions_to_remove {
+            // Invalidate cached state; deletion can also clear malformed tokens.
+            let _ = store.reload_tokens(&s.site, org);
             store.delete_tokens(&s.site, org)?;
             // Client credentials are site-scoped and shared across orgs; only
             // delete them when logging out the default (no-org) session.
@@ -589,7 +603,8 @@ pub async fn refresh(cfg: &Config) -> Result<()> {
     let site = &cfg.site;
     let org = cfg.org.as_deref();
 
-    let tokens = with_storage(|store| store.load_tokens(site, org))?.ok_or_else(|| {
+    let _session_lock = storage::lock_sessions()?;
+    let tokens = with_storage(|store| store.reload_tokens(site, org))?.ok_or_else(|| {
         anyhow::anyhow!("no tokens found for site {site} — run 'pup auth login' first")
     })?;
 
@@ -605,10 +620,11 @@ pub async fn refresh(cfg: &Config) -> Result<()> {
     eprintln!("🔄 Refreshing access token for site: {site}{org_label}...");
 
     let dcr_client = dcr::DcrClient::new(site);
-    let new_tokens = dcr_client
+    let mut new_tokens = dcr_client
         .refresh_token(&tokens.refresh_token, &tokens.refresh_credentials(&creds))
         .await?;
 
+    new_tokens.session_id = tokens.session_id.clone();
     let location = with_storage(|store| {
         store.save_tokens(site, org, &new_tokens)?;
         Ok(store.storage_location())
@@ -683,6 +699,54 @@ pub fn list(cfg: &Config) -> Result<()> {
 #[cfg(target_arch = "wasm32")]
 pub fn list(_cfg: &Config) -> Result<()> {
     bail!("Session listing is not available in WASM builds.")
+}
+
+/// Export exactly the selected saved OAuth session, independently of config and
+/// environment credential precedence. A legacy session receives an ID atomically.
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn stored_session_token(site: &str, org: Option<&str>) -> Result<()> {
+    if !crate::settings::is_datadog_owned_host(site) {
+        bail!("saved-session export requires a Datadog site");
+    }
+    let _session_lock = storage::lock_sessions()?;
+    let sessions = storage::list_sessions()?;
+    let mut selected = sessions
+        .iter()
+        .filter(|session| session.org.as_deref() == org);
+    if selected.next().is_none_or(|session| session.site != site) || selected.next().is_some() {
+        bail!("no unique saved OAuth session for the selected site and org; run 'pup auth login' for that selection");
+    }
+    let mut tokens = with_storage(|store| store.reload_tokens(site, org))?
+        .ok_or_else(|| anyhow::anyhow!("no saved OAuth session for the selected site and org; run 'pup auth login' for that selection"))?;
+    if tokens.session_id.is_empty() {
+        tokens.session_id = uuid::Uuid::new_v4().to_string();
+        with_storage(|store| store.save_tokens(site, org, &tokens))?;
+    }
+    if tokens.is_expired() {
+        if tokens.refresh_token.is_empty() {
+            bail!("saved OAuth session has expired; run 'pup auth login' for that selection");
+        }
+        let creds =
+            with_storage(|store| store.load_client_credentials(site))?.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "saved OAuth client is missing; run 'pup auth login' for that selection"
+                )
+            })?;
+        let mut refreshed = crate::auth::dcr::DcrClient::new(site)
+            .refresh_token(&tokens.refresh_token, &tokens.refresh_credentials(&creds)).await
+            .map_err(|_| anyhow::anyhow!("saved OAuth session could not be refreshed; run 'pup auth login' for that selection"))?;
+        refreshed.session_id = tokens.session_id;
+        with_storage(|store| store.save_tokens(site, org, &refreshed))?;
+        tokens = refreshed;
+    }
+    if tokens.access_token.is_empty() || tokens.is_expired() {
+        bail!("saved OAuth session has no usable access token; run 'pup auth login' for that selection");
+    }
+    println!(
+        "{}",
+        serde_json::json!({"access_token": tokens.access_token, "site": site, "session_id": tokens.session_id, "scope": tokens.scope})
+    );
+    Ok(())
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -987,6 +1051,7 @@ mod tests {
         refresh_token: &str,
     ) -> crate::auth::types::TokenSet {
         crate::auth::types::TokenSet {
+            session_id: String::new(),
             access_token: "access".into(),
             refresh_token: refresh_token.into(),
             token_type: "Bearer".into(),
